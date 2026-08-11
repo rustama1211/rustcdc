@@ -303,26 +303,55 @@ pub(super) async fn query_all_columns(
 ///
 /// `format` renders SQL NULL as the empty string, which would erase the distinction between
 /// a NULL column and an empty one — so each column is guarded by a `CASE`, leaving NULL as
-/// SQL NULL for `json_build_object` to render as JSON `null`.
+/// SQL NULL for the JSON constructor to render as JSON `null`.
 ///
-/// Verified against PostgreSQL 16:
-/// `{"b": "t", "n": null, "e": "", "x": "9223372036854775807"}`.
+/// # Why `json_object(text[], text[])` and not `json_build_object(k, v, …)`
+///
+/// `json_build_object` takes one argument per key and one per value, so a table of `n`
+/// columns needs `2n` arguments. PostgreSQL caps any function call at `FUNC_MAX_ARGS`,
+/// which is **100** in every stock build — a compile-time constant, not a setting. So a
+/// table with 51 or more columns made the snapshot query fail outright with
+///
+/// ```text
+/// ERROR:  54023: cannot pass more than 100 arguments to a function
+/// ```
+///
+/// and, because that happens on the snapshot connection while the replication connection is
+/// already open, the visible symptom was an `unexpected EOF on standby connection` in the
+/// server log rather than anything naming the real cause. Wide tables — the ones most worth
+/// replicating — were exactly the ones that could not be snapshotted.
+///
+/// `json_object` takes two arguments total, whatever the column count: an array of keys and
+/// an array of values. `ARRAY[…]` is a constructor rather than a function call, so
+/// `FUNC_MAX_ARGS` does not apply to it (verified at 400 elements).
+///
+/// The output is byte-identical to the old form — same `" : "` spacing, same `null` for SQL
+/// NULL, same `\"` escaping — so this changes no consumer's parse. Verified against
+/// PostgreSQL 16 and 18:
+/// `{"b" : "t", "n" : null, "e" : "", "x" : "9223372036854775807", "q" : "he\"llo"}`.
 pub(super) fn row_as_text_json(columns: &[String]) -> String {
     if columns.is_empty() {
         return "'{}'::json::text".to_string();
     }
-    let pairs = columns
+
+    let keys = columns
+        .iter()
+        .map(|column| quote_pg_literal(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Explicitly `::text[]`: an all-NULL row would otherwise leave the array element type
+    // unresolved and `json_object` ambiguous.
+    let values = columns
         .iter()
         .map(|column| {
             let quoted = quote_pg_identifier(column);
-            format!(
-                "{}, CASE WHEN t.{quoted} IS NULL THEN NULL ELSE format('%s', t.{quoted}) END",
-                quote_pg_literal(column)
-            )
+            format!("CASE WHEN t.{quoted} IS NULL THEN NULL ELSE format('%s', t.{quoted}) END")
         })
         .collect::<Vec<_>>()
         .join(", ");
-    format!("json_build_object({pairs})::text")
+
+    format!("json_object(ARRAY[{keys}]::text[], ARRAY[{values}]::text[])::text")
 }
 
 /// Quote a string as a SQL literal, doubling any embedded quote.
@@ -335,6 +364,59 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    // ── row_as_text_json ──────────────────────────────────────────────────────
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn row_json_stays_within_the_function_argument_limit() {
+        // The regression: json_build_object needs 2 arguments per column and
+        // PostgreSQL caps a function call at FUNC_MAX_ARGS (100), so any table
+        // with 51+ columns failed the snapshot with SQLSTATE 54023. json_object
+        // takes two arrays, so the argument count is constant.
+        let wide: Vec<String> = (0..500).map(|i| format!("c{i}")).collect();
+        let sql = row_as_text_json(&wide);
+
+        assert!(
+            !sql.contains("json_build_object"),
+            "must not build a per-column argument list"
+        );
+        assert!(sql.starts_with("json_object(ARRAY["));
+        // Two arguments to the function, however many columns there are.
+        assert_eq!(sql.matches("::text[], ARRAY[").count(), 1);
+    }
+
+    #[test]
+    fn row_json_guards_each_column_so_null_stays_null() {
+        // format() renders NULL as the empty string; without the CASE a NULL
+        // column and an empty one would be indistinguishable downstream.
+        let sql = row_as_text_json(&cols(&["id", "note"]));
+        assert_eq!(
+            sql,
+            "json_object(ARRAY['id', 'note']::text[], ARRAY[\
+             CASE WHEN t.\"id\" IS NULL THEN NULL ELSE format('%s', t.\"id\") END, \
+             CASE WHEN t.\"note\" IS NULL THEN NULL ELSE format('%s', t.\"note\") END\
+             ]::text[])::text"
+        );
+    }
+
+    #[test]
+    fn row_json_quotes_identifiers_and_literals_separately() {
+        // A column named with a quote must be escaped one way as an identifier
+        // and another as a literal; conflating them is an injection.
+        let sql = row_as_text_json(&cols(&["we\"ird"]));
+        assert!(sql.contains("'we\"ird'"), "literal form: {sql}");
+        assert!(sql.contains("t.\"we\"\"ird\""), "identifier form: {sql}");
+    }
+
+    #[test]
+    fn row_json_for_no_columns_is_an_empty_object() {
+        assert_eq!(row_as_text_json(&[]), "'{}'::json::text");
+    }
+
 
     // ── Mock ReconcileOps ─────────────────────────────────────────────────────
 
