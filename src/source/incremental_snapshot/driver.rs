@@ -100,10 +100,10 @@ use crate::{
     },
 };
 
-/// Emitted-event batch size when draining a merged chunk.
+/// Fallback emitted-event batch size, used only when `chunk_size` is zero.
 ///
-/// Bounds the memory a single `next_events` return can hold; the remainder of the
-/// chunk is drained by subsequent calls.
+/// See [`IncrementalSnapshotDriver::emit_batch_size`] for why this is no longer
+/// a fixed cap.
 const EMIT_BATCH_SIZE: usize = 1_000;
 
 /// Upper bound on how long a single collect iteration waits on the inner stream.
@@ -1169,15 +1169,40 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
         table.rows_emitted = table.rows_emitted.saturating_add(row_count);
     }
 
+    /// How many events a single `next_events` call may return.
+    ///
+    /// This used to be a fixed 1_000, which silently capped `chunk_size`: a
+    /// 50_000-row chunk was handed to the consumer in 50 pieces. A consumer
+    /// that commits once per delivery -- the normal shape, and the one the ack
+    /// protocol pushes you toward, since `poll_event_batch` redelivers until
+    /// acked -- therefore paid 50 durable commits for one chunk. Against a
+    /// file-backed DuckDB sink that was measured at 57% of all pipeline time,
+    /// and lifting the cap was worth 2.1x end to end.
+    ///
+    /// Following `chunk_size` restores the memory bound this was protecting:
+    /// the driver already holds a whole chunk in `Phase::ChunkEmit`, so
+    /// draining it in one go adds no peak that reading it did not already
+    /// require.
+    fn emit_batch_size(&self) -> usize {
+        if self.chunk_size == 0 {
+            EMIT_BATCH_SIZE
+        } else {
+            self.chunk_size
+        }
+    }
+
     /// Drain up to one batch of held-back post-high-watermark log events.
     fn drain_deferred(&mut self) -> Vec<Event> {
-        let batch_size = self.deferred.len().min(EMIT_BATCH_SIZE);
+        let batch_size = self.deferred.len().min(self.emit_batch_size());
         self.deferred.drain(..batch_size).collect()
     }
 
     /// Advance the state machine by one step.
     async fn drive(&mut self, timeout_ms: u64) -> Result<Vec<Event>> {
         loop {
+            // Read before the match: the ChunkEmit arm borrows `self.phase`
+            // mutably, so `self` cannot be touched again inside it.
+            let emit_batch_size = self.emit_batch_size();
             match self.phase {
                 Phase::Done => {
                     // A final chunk can straddle its high watermark and leave held-back
@@ -1195,7 +1220,7 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
                     ref mut next_cursor,
                     row_count,
                 } => {
-                    let batch_size = events.len().min(EMIT_BATCH_SIZE);
+                    let batch_size = events.len().min(emit_batch_size);
                     if batch_size > 0 {
                         return Ok(events.drain(..batch_size).collect());
                     }
