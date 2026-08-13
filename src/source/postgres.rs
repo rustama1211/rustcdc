@@ -31,6 +31,8 @@ mod stream_messages;
 mod stream_start;
 mod streaming;
 mod validation;
+#[cfg(feature = "pg-walstream")]
+mod walstream;
 mod wire;
 
 // Import decoder types used directly in this module.
@@ -648,6 +650,31 @@ pub enum WalTransport {
     ///
     /// Prefer fixing the environment. Reach for this when you cannot.
     SqlPeek,
+    /// `START_REPLICATION ... LOGICAL` over the [`pg_walstream`] crate instead of
+    /// rustcdc's own [`wire`](self::wire) client.
+    ///
+    /// Protocol-wise this is the same transport as
+    /// [`StreamingReplication`](Self::StreamingReplication) and carries the same
+    /// requirements — the `REPLICATION` attribute and a direct, unpooled connection. It
+    /// exists to make the two clients substitutable so they can be compared, and because
+    /// `pg_walstream` implements pgoutput protocol versions 2–4 (streaming transactions,
+    /// two-phase commit) that the built-in client does not negotiate.
+    ///
+    /// It is wired in over `next_raw_event`, which yields undecoded pgoutput bytes, so
+    /// rustcdc's decoder still decodes them. Anything the decoder does not understand is
+    /// therefore still not understood here: requesting a protocol version above 1 would
+    /// put `Stream*` and `*Prepared` messages on the wire that the decoder reports as
+    /// [`PgOutputMessage::Unknown`](self::decoder), so this negotiates version 1 for now
+    /// and the extra protocol coverage is latent rather than available.
+    ///
+    /// Requires the `pg-walstream` feature. Selecting it without that feature is a
+    /// configuration error, raised at stream start rather than silently falling back —
+    /// quietly running a transport the operator did not ask for is worse than failing.
+    ///
+    /// **Does not support mTLS.** `pg_walstream` has no `sslcert`/`sslkey` connection
+    /// parameter, so a [`TransportConfig::Tls`](crate::core::TransportConfig) carrying a
+    /// `client_cert_path` is rejected at connect time.
+    PgWalstream,
 }
 
 /// PostgreSQL connector lifecycle manager.

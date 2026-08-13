@@ -523,8 +523,9 @@ long-lived stream is how a disk fills up.
 
 | Value | Mechanism | Choose it when |
 |---|---|---|
-| `StreamingReplication` (default) | `START_REPLICATION ... LOGICAL` | Always, unless the environment forbids it |
+| `StreamingReplication` (default) | `START_REPLICATION ... LOGICAL`, rustcdc's own client | Always, unless the environment forbids it |
 | `SqlPeek` | `pg_logical_slot_peek_binary_changes` | A replication connection cannot be arranged |
+| `PgWalstream` | `START_REPLICATION ... LOGICAL`, via the [`pg_walstream`](https://crates.io/crates/pg_walstream) crate | Measured it against your own workload and it won |
 
 `StreamingReplication` requires two things `SqlPeek` does not:
 
@@ -538,6 +539,43 @@ same events, LSNs included, so switching is an access-and-performance decision r
 correctness one — but `SqlPeek` measures **4–5× slower for identical capture work**, and it
 re-reads WAL from the slot's `restart_lsn` on every poll rather than once per connection.
 Selecting it logs a warning naming the trade-off, so nobody inherits it by accident.
+
+#### `PgWalstream`
+
+Requires the **`pg-walstream`** Cargo feature; selecting it without that feature is a
+configuration error raised at stream start, not a silent fallback. It runs the same
+protocol as `StreamingReplication` and has the same `REPLICATION`-attribute and
+direct-connection requirements — only the client code differs. Both hand their undecoded
+pgoutput bytes to the same decoder, and
+`tests/postgres_wal_transport_parity_integration.rs` asserts they produce identical events.
+
+**Measure before switching.** The `pg_walstream` project publishes a figure around 177 000
+events/sec, which is what it costs to read WAL and throw it away — not what a connector
+sustains end to end. `cargo bench --bench throughput` gives rustcdc's own runtime ceiling
+(poll → transform → sink → ack → checkpoint), and that ceiling sits well above the
+published transport figure. **If your pipeline runs far below it, the transport is not what
+is limiting you** — look at the sink and at the commit batch size. To get the head-to-head
+on your own hardware:
+
+```console
+$ CDC_RS_RUN_DOCKER_TESTS=1 cargo test --release --features pg-walstream \
+    --test postgres_wal_transport_throughput_evidence -- --nocapture
+```
+
+Two constraints to know before enabling it:
+
+- **It cannot do mTLS.** `pg_walstream` is configured through a connection string, which has
+  no `sslcert`/`sslkey` equivalent and cannot carry an injected `rustls::ClientConfig`. A
+  `TransportConfig` using `client_cert_path`, `allow_invalid_certificates`,
+  `allow_invalid_hostnames`, or `RustlsConfig` is **rejected at connect time** rather than
+  quietly downgraded. Use `StreamingReplication` for those.
+- **It adds a second TLS crypto provider.** The crate hard-wires `rustls/aws_lc_rs`
+  alongside the `ring` the rest of rustcdc uses, which brings a build-time `cmake` + C
+  compiler requirement the default build does not have.
+
+It negotiates pgoutput protocol **version 1**, matching rustcdc's decoder. The crate's
+v2–v4 support (streaming transactions, two-phase commit) is therefore not reachable through
+this transport yet — raising the version needs decoder work, so it is not a knob.
 
 Why, and what each measures at: [WAL transport](@/docs/architecture.md#wal-transport) ·
 [measured performance](@/docs/reliability-testing.md#measured-performance).

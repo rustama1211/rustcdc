@@ -35,6 +35,28 @@ postgres = [
     "dep:md-5",
     "tls",
 ]
+# Alternative PostgreSQL WAL transport built on the `pg_walstream` crate, selected at
+# runtime with `WalTransport::PgWalstream`. Opt-in and additive: `wire` remains the
+# default and is untouched, so this changes nothing unless both the feature is enabled
+# *and* the transport is chosen.
+#
+# It plugs in as a `PgOutputMessageProvider` over `next_raw_event`, which yields undecoded
+# pgoutput bytes. rustcdc's own decoder therefore still does the decoding, exactly as it
+# does for `wire` — the two transports cannot disagree about what a message means, and a
+# benchmark between them measures transport and nothing else.
+#
+# Two costs, both real:
+#
+# * **Build weight.** `pg_walstream`'s `rustls-tls` feature hard-wires `rustls/aws_lc_rs`,
+#   so this adds a second crypto provider alongside the `ring` the rest of the crate uses,
+#   and with it a build-time `cmake` + C compiler requirement the default build does not
+#   have. Both crates construct their configs with `builder_with_provider` rather than
+#   relying on the process-wide default, so they coexist without the ambiguous-provider
+#   panic that additive rustls features would otherwise cause — but the binary carries two.
+# * **No mTLS.** `pg_walstream` parses `sslmode`/`sslrootcert` from the connection string
+#   and has no `sslcert`/`sslkey` equivalent, so a `TransportConfig::Tls` carrying
+#   `client_cert_path` is rejected at connect time rather than silently downgraded.
+pg-walstream = ["postgres", "dep:pg_walstream"]
 # Enable MySQL-specific source implementations.
 mysql = ["dep:mysql_async", "dep:mysql_common", "mysql_async/rustls-tls", "mysql_async/ring", "tls"]
 # Enable MariaDB CDC support. Uses the MySQL binlog connector under the hood;
@@ -137,6 +159,12 @@ mysql_async = { version = "0.37", default-features = false, features = ["minimal
 mysql_common = { version = "0.37", default-features = false, features = ["binlog"], optional = true }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "tokio", "rustls"], optional = true }
 tokio-util = { version = "0.7.16", features = ["compat"] }
+# Alternative WAL transport — see the `pg-walstream` feature for why this is opt-in.
+# `default-features = false` + `rustls-tls` is spelled out rather than left implicit
+# because the alternative default (`libpq`) would put a C toolchain and an OpenSSL link
+# on the build, and because being explicit here is what makes the aws-lc-rs it drags in
+# visible at the point someone is deciding whether to enable the feature.
+pg_walstream = { version = "0.8.1", default-features = false, features = ["std", "rustls-tls"], optional = true }
 rustls = { version = "0.23.19", default-features = false, features = ["std", "ring"], optional = true }
 rustls-native-certs = { version = "0.8", optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }

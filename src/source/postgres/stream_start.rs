@@ -117,6 +117,27 @@ pub(super) async fn start_postgres_stream(
                     confirmed_lsn: initial_confirmed_lsn,
                 })
             }
+            #[cfg(feature = "pg-walstream")]
+            WalTransport::PgWalstream => Box::new(
+                super::walstream::WalstreamPgOutputProvider::connect(
+                    &connection.config,
+                    initial_confirmed_lsn,
+                )
+                .await?,
+            ),
+            // Refused rather than quietly falling back to the built-in client: an operator
+            // who selected this transport did so to run *that* client, and a silent
+            // substitution would make a benchmark compare a thing against itself.
+            #[cfg(not(feature = "pg-walstream"))]
+            WalTransport::PgWalstream => {
+                return Err(Error::ConfigError(
+                    "WalTransport::PgWalstream requires the 'pg-walstream' Cargo feature, \
+                     which is not enabled in this build. Rebuild with \
+                     --features pg-walstream, or select \
+                     WalTransport::StreamingReplication."
+                        .into(),
+                ));
+            }
         };
     Ok(Box::new(PostgresStreamHandle::new(
         connection.source_type().to_string(),

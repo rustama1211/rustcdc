@@ -5,6 +5,52 @@ All notable changes to this project are documented here.
 The project is pre-1.0. Minor version bumps may contain breaking changes; each one lists
 what breaks and what to do about it.
 
+## Unreleased
+
+### `pg-walstream`: an alternative PostgreSQL WAL transport
+
+New **opt-in** Cargo feature `pg-walstream`, adding `WalTransport::PgWalstream` — the same
+`START_REPLICATION ... LOGICAL` stream carried by the [`pg_walstream`] crate instead of
+rustcdc's own `wire` client. `wire` remains the default and is unchanged; nothing about an
+existing build moves unless both the feature is enabled *and* the transport is selected.
+
+It plugs in at `PgOutputMessageProvider`, reading through `next_raw_event` so the undecoded
+pgoutput bytes go to **rustcdc's decoder**, exactly as they do for `wire`. The two
+transports therefore cannot disagree about what a message means, and a measurement between
+them measures the replication client and nothing else.
+`tests/postgres_wal_transport_parity_integration.rs` asserts they decode identical event
+streams.
+
+**On performance.** `pg_walstream` publishes ~177 000 events/sec for reading WAL and
+discarding it. That is not a connector throughput figure, and `cargo bench --bench
+throughput` puts rustcdc's own runtime ceiling — poll through transform, sink, ack and
+checkpoint — well above it. **A pipeline running far below that ceiling is not
+transport-bound**, and swapping the transport will not move it; the sink and the commit
+batch size are the places to look. `tests/postgres_wal_transport_throughput_evidence.rs`
+prints the head-to-head so the question can be settled with a number rather than a
+headline.
+
+Two costs, both real and both the reason this is opt-in rather than default:
+
+* **Build weight.** `pg_walstream`'s `rustls-tls` feature hard-wires `rustls/aws_lc_rs`, so
+  enabling it adds a second crypto provider beside the `ring` the rest of the crate uses,
+  and with it a build-time `cmake` + C compiler requirement the default build does not
+  have. The two coexist safely — both crates build their configs with
+  `builder_with_provider` rather than relying on the process-wide default, which is what
+  would otherwise turn additive rustls features into an ambiguous-provider panic.
+* **Reduced TLS surface.** `pg_walstream` is configured through a connection string, which
+  has no `sslcert`/`sslkey` equivalent and cannot carry an injected `rustls::ClientConfig`.
+  mTLS, `allow_invalid_certificates` and `TransportConfig::RustlsConfig` are therefore
+  **rejected at connect time** rather than silently downgraded. Use
+  `WalTransport::StreamingReplication` for those.
+
+The transport negotiates pgoutput protocol **version 1**, matching what rustcdc's decoder
+implements. `pg_walstream` supports v1–v4, so its streaming-transaction and two-phase
+message coverage is latent here rather than available; raising the version is a change to
+the decoder, not a configuration knob.
+
+[`pg_walstream`]: https://crates.io/crates/pg_walstream
+
 ## 0.13.0
 
 Five further audit passes over the tree released as 0.12.0 — the third through seventh of this

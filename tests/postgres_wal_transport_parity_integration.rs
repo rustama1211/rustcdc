@@ -31,11 +31,26 @@ use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
 };
 
+/// Container image, overridable with `CDC_RS_PG_IMAGE` (e.g. `postgres:16`).
+///
+/// The tag is configurable so the suite still runs on a machine that cannot reach Docker
+/// Hub but has a usable PostgreSQL image cached under a different tag. Any image that
+/// accepts the `wal_level=logical` flags below works; the default is unchanged.
+fn postgres_image() -> (String, String) {
+    let spec =
+        std::env::var("CDC_RS_PG_IMAGE").unwrap_or_else(|_| "postgres:16-alpine".to_string());
+    match spec.rsplit_once(':') {
+        Some((name, tag)) => (name.to_string(), tag.to_string()),
+        None => (spec, "latest".to_string()),
+    }
+}
+
 /// Start a logical-replication-capable PostgreSQL with a given password encryption.
 async fn start_postgres(
     password_encryption: &str,
 ) -> rustcdc::Result<ContainerAsync<GenericImage>> {
-    GenericImage::new("postgres", "16-alpine")
+    let (name, tag) = postgres_image();
+    GenericImage::new(name, tag)
         .with_exposed_port(5432.tcp())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
@@ -426,6 +441,95 @@ async fn the_streaming_transport_authenticates_with_md5() -> rustcdc::Result<()>
         events.iter().any(|event| event.op == Operation::Insert),
         "the streaming transport must capture changes on an md5-authenticated server"
     );
+
+    Ok(())
+}
+
+/// The `pg_walstream` transport must decode to exactly what the built-in client does.
+///
+/// This is the correctness precondition for the throughput comparison in
+/// `postgres_wal_transport_throughput_evidence`: a transport that is faster because it
+/// delivers *less* is not faster. Both feed the same decoder — see
+/// `source::postgres::walstream` — so any divergence here is the replication client
+/// framing the pgoutput payload differently, which would make the two transports'
+/// checkpoints non-interchangeable.
+///
+/// Gated on the `pg-walstream` feature; the built-in transport is always compiled.
+#[cfg(feature = "pg-walstream")]
+#[tokio::test]
+async fn the_pg_walstream_transport_matches_the_built_in_client() -> rustcdc::Result<()> {
+    if std::env::var("CDC_RS_RUN_DOCKER_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping pg_walstream parity test (set CDC_RS_RUN_DOCKER_TESTS=1)");
+        return Ok(());
+    }
+
+    let container = start_postgres("scram-sha-256").await?;
+    let (admin, host, port) = admin_client(&container).await?;
+
+    admin
+        .batch_execute(
+            "
+            CREATE TABLE public.parity (id BIGINT PRIMARY KEY, name TEXT, balance BIGINT);
+            ALTER TABLE public.parity REPLICA IDENTITY FULL;
+            CREATE PUBLICATION parity_pub FOR TABLE public.parity;
+            ",
+        )
+        .await
+        .map_err(|error| rustcdc::Error::SourceError(rustcdc::render_error_chain(&error)))?;
+
+    // Both slots exist before the workload runs, so both see identical WAL.
+    create_slot(&admin, "slot_wire").await?;
+    create_slot(&admin, "slot_walstream").await?;
+
+    let mut wire_source = PostgresConnection::new(source_config(
+        &host,
+        port,
+        "slot_wire",
+        WalTransport::StreamingReplication,
+    ));
+    wire_source.connect().await?;
+    let mut wire = wire_source.start_stream(None).await?;
+
+    let mut walstream_source = PostgresConnection::new(source_config(
+        &host,
+        port,
+        "slot_walstream",
+        WalTransport::PgWalstream,
+    ));
+    walstream_source.connect().await?;
+    let mut walstream = walstream_source.start_stream(None).await?;
+
+    apply_workload(&admin).await?;
+
+    const EXPECTED_EVENTS: usize = 6;
+    let wire_events = drain(&mut wire, EXPECTED_EVENTS, "wire").await?;
+    let walstream_events = drain(&mut walstream, EXPECTED_EVENTS, "pg_walstream").await?;
+
+    let wire_captured: Vec<Captured> = wire_events.iter().map(capture).collect();
+    let walstream_captured: Vec<Captured> = walstream_events.iter().map(capture).collect();
+
+    assert!(
+        !walstream_captured.is_empty(),
+        "the pg_walstream transport captured nothing; next_raw_event is not delivering"
+    );
+    assert_eq!(
+        wire_captured, walstream_captured,
+        "the pg_walstream transport must decode the same WAL into the same events as the \
+         built-in client. A difference means one of them is framing the pgoutput payload \
+         differently, so their checkpoints are not interchangeable — and it invalidates \
+         any throughput comparison between them.\n\
+         wire: {wire_captured:#?}\npg_walstream: {walstream_captured:#?}"
+    );
+
+    // Same guard the two-transport test uses: a silently empty capture must not be able to
+    // satisfy the equality assertion above.
+    let ops: Vec<Operation> = walstream_captured.iter().map(|event| event.op).collect();
+    for expected in [Operation::Insert, Operation::Update, Operation::Delete] {
+        assert!(
+            ops.contains(&expected),
+            "the workload must produce a {expected:?} event; got {ops:?}"
+        );
+    }
 
     Ok(())
 }
