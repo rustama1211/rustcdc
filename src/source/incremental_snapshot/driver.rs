@@ -1113,24 +1113,36 @@ impl<B: IncrementalSnapshotBackend> IncrementalSnapshotDriver<B> {
 
     /// Merge the chunk against the override set and enter `ChunkEmit`.
     fn finalize_collect(&mut self) {
+        if !matches!(self.phase, Phase::ChunkCollect { .. }) {
+            return;
+        }
+
+        // Take the phase by value so the chunk's events can be MOVED into the emit
+        // queue rather than cloned into it.
+        //
+        // This used to borrow `chunk_rows` and clone every event, while the original
+        // was dropped one line later when `self.phase` was overwritten -- so the clone
+        // bought nothing. It is not a small cost: an `Event` owns its `after` image, so
+        // cloning one duplicates a whole JSON object, and a wide table means dozens of
+        // keys and values allocated per row. On a 12.6M-row table that was 12.6M
+        // needless deep clones on the snapshot's hottest path.
         let Phase::ChunkCollect {
             table_idx,
-            ref chunk_rows,
-            ref override_pks,
-            ref next_cursor,
+            chunk_rows,
+            override_pks,
+            next_cursor,
             ..
-        } = self.phase
+        } = std::mem::replace(&mut self.phase, Phase::Done)
         else {
-            return;
+            unreachable!("guarded by the matches! above");
         };
 
-        let merged: VecDeque<Event> = chunk_rows
-            .iter()
-            .filter(|(fingerprint, _)| !override_pks.contains(fingerprint))
-            .map(|(_, event)| event.clone())
-            .collect();
         let suppressed = override_pks.len();
-        let next_cursor = next_cursor.clone();
+        let merged: VecDeque<Event> = chunk_rows
+            .into_iter()
+            .filter(|(fingerprint, _)| !override_pks.contains(fingerprint))
+            .map(|(_, event)| event)
+            .collect();
 
         let emitted = merged.len() as u64;
 
