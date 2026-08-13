@@ -21,20 +21,39 @@
 //! The same argument the `streaming` module makes about byte-for-byte fidelity therefore
 //! applies here unchanged.
 //!
-//! # Cancellation, and why there is no `tokio::time::timeout` here
+//! # Cancellation, and why the budget is a `tokio::time::timeout`
 //!
-//! [`PgOutputMessageProvider::poll_xlog_data`] must return within its budget, and the
-//! obvious way to bound an async call is to wrap it in [`tokio::time::timeout`], which
-//! drops the future when it fires. `pg_walstream` documents the opposite contract on this
-//! path — *"cancel via `cancellation_token` rather than by dropping this future"* — so a
-//! dropped `next_raw_event` is outside what the crate promises to survive.
+//! [`PgOutputMessageProvider::poll_xlog_data`] must return within its budget.
+//! `pg_walstream` documents *"cancel via `cancellation_token` rather than by dropping
+//! this future"*, and this module originally followed that literally: a child
+//! [`CancellationToken`] per blocking wait, cancelled by a timer task.
 //!
-//! Reading its implementation suggests a drop would in fact be safe today: the inner await
-//! is an `AsyncReadExt::read_buf` into a buffer owned by the connection, so a cancelled
-//! poll loses no bytes. That is an implementation detail of a 0.x crate that has shipped
-//! sixteen releases in eight months, and building on it would mean a silent stream
-//! corruption the first time it changed. This module uses the documented mechanism: a
-//! child [`CancellationToken`] per blocking wait, cancelled by a timer task.
+//! **That deadlocks the stream, and it is not a rare race.** Measured on a cold start
+//! (snapshot and stream running together, so the stream times out on nearly every poll),
+//! three runs in four wedged: one `Backend worker error: already streaming`, then no
+//! further progress, with the process still holding its slot until killed.
+//!
+//! The mechanism is in the crate's threaded driver. On cancellation the *caller* side
+//! returns immediately and clears its `batch_rx` — commented there as "stream is ending"
+//! — while the worker is still inside `stream_copy` awaiting the socket, unaware. The
+//! next poll therefore sees `batch_rx.is_none()`, sends a second `Command::StreamCopy`,
+//! and the still-running worker rejects it as `already streaming`. The crate's
+//! cancellation contract assumes a cancel is *terminal*; a per-poll timeout is not.
+//!
+//! So the budget is a [`tokio::time::timeout`] and the token is never cancelled while
+//! polling. Dropping the read future is safe on both drivers, and for a stronger reason
+//! than the earlier note gave: every piece of state a partial read could have advanced
+//! lives on the connection rather than in the future.
+//!
+//! * Threaded: the only await is a `select!` over `batch_rx.recv()`, which is
+//!   cancel-safe, and the batch it would have produced is still queued. `pending` and
+//!   `batch_rx` are untouched, so nothing re-sends `StreamCopy` — the stream is never
+//!   torn down at all, which is why this also fixes the wedge rather than hiding it.
+//! * Inline: the await is an `AsyncReadExt::read_buf` into the connection's own
+//!   `read_buf`, so a dropped poll loses no bytes.
+//!
+//! Between receiving a batch and storing it there is no await at all (`*pending = batch`
+//! then `pop_front`), so a timeout cannot land in the middle and lose one.
 //!
 //! # What this transport does not do
 //!
@@ -161,23 +180,21 @@ impl WalstreamPgOutputProvider {
     /// Await one raw XLogData, giving up after `budget`.
     ///
     /// Returns `Ok(None)` on timeout, which is the caller's signal to stop batching.
-    /// The timer runs as a task rather than a `select!` arm so that the read future is
-    /// never dropped — see the module docs.
+    ///
+    /// The budget is a `timeout` and `self.cancel` is deliberately never cancelled here.
+    /// Cancelling it per poll is what wedged the stream with `already streaming` — see
+    /// the module docs. The token still exists because the API takes one, and because
+    /// `Drop` uses it to stop the worker when the provider really is going away.
     async fn next_within(&mut self, budget: Duration) -> Result<Option<PgOutputXLogData>> {
-        let child = self.cancel.child_token();
-        let timer = {
-            let child = child.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(budget).await;
-                child.cancel();
-            })
-        };
+        // Cloned so the token borrow does not collide with the `&mut self.stream` one.
+        let token = self.cancel.clone();
 
-        let result = self.stream.next_raw_event(&child).await;
-        // The read finished first; stop the timer so it does not outlive the poll. Aborting
-        // a `sleep` that has not fired is free, and one that has fired has already
-        // cancelled a token nothing else observes.
-        timer.abort();
+        let result = match tokio::time::timeout(budget, self.stream.next_raw_event(&token)).await {
+            // Budget expired. The stream is left exactly as it was: still streaming,
+            // still buffering, nothing to restart.
+            Err(_elapsed) => return Ok(None),
+            Ok(result) => result,
+        };
 
         match result {
             Ok(raw) => Ok(Some(PgOutputXLogData {
@@ -189,7 +206,8 @@ impl WalstreamPgOutputProvider {
                 // costs the comparison nothing.
                 data: raw.data.to_vec(),
             })),
-            // Only ever our own timer: `self.cancel` is not cancelled anywhere else.
+            // Only reachable if something cancels `self.cancel`, which now happens solely
+            // on `Drop`. Treated as "no data" rather than an error for that reason.
             Err(ReplicationError::Cancelled(_)) => Ok(None),
             Err(error) => Err(Error::SourceError(format!(
                 "pg_walstream read failed on slot '{}': {error}",
